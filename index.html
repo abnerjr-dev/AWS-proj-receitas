@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Descobridor de Receitas</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1>🍳 Descobridor de Receitas</h1>
+      <p>Faça o upload de uma foto dos seus ingredientes e receba sugestões de receitas!</p>
+
+      <div class="upload-area" id="uploadArea">
+        <span class="upload-icon">📁</span>
+        <p>Clique aqui ou arraste uma imagem para esta área</p>
+        <input type="file" id="fileInput" accept="image/jpeg, image/png, image/jpg" />
+      </div>
+
+      <img id="imagePreview" alt="Prévia da imagem selecionada" />
+
+      <button id="uploadButton">Enviar Imagem e Gerar Receita</button>
+
+      <div id="status"></div>
+
+      <div id="resultado"></div>
+    </div>
+
+    <script>
+      const API_URL = "https://1usbpeqsll.execute-api.us-east-1.amazonaws.com/dev";
+      let requestId = null;
+
+      const uploadArea = document.getElementById("uploadArea");
+      const fileInput = document.getElementById("fileInput");
+      const imagePreview = document.getElementById("imagePreview");
+      const uploadButton = document.getElementById("uploadButton");
+      const statusDiv = document.getElementById("status");
+      const resultadoDiv = document.getElementById("resultado");
+
+      // Event Listeners
+      uploadArea.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", handleFileSelect);
+      uploadButton.addEventListener("click", uploadImage);
+      setupDragAndDrop();
+
+      function handleFileSelect(event) {
+        const file = event.target.files[0];
+        if (file && isValidImage(file)) {
+          showImagePreview(file);
+        }
+      }
+
+      function isValidImage(file) {
+        if (!file.type.match("image/jpeg") && !file.type.match("image/png")) {
+          alert("Por favor, selecione um arquivo de imagem (JPEG ou PNG).");
+          return false;
+        }
+        return true;
+      }
+
+      function showImagePreview(file) {
+        const reader = new FileReader();
+        reader.onload = function (e) {
+          imagePreview.src = e.target.result;
+          imagePreview.style.display = "block";
+          uploadButton.style.display = "block";
+        };
+        reader.readAsDataURL(file);
+      }
+
+      function setupDragAndDrop() {
+        uploadArea.addEventListener("dragover", (e) => {
+          e.preventDefault();
+          uploadArea.classList.add("dragover");
+        });
+
+        uploadArea.addEventListener("dragleave", () => {
+          uploadArea.classList.remove("dragover");
+        });
+
+        uploadArea.addEventListener("drop", (e) => {
+          e.preventDefault();
+          uploadArea.classList.remove("dragover");
+          fileInput.files = e.dataTransfer.files;
+          const event = new Event("change");
+          fileInput.dispatchEvent(event);
+        });
+      }
+
+      async function uploadImage() {
+        const file = fileInput.files[0];
+        if (!file) return;
+
+        setUploadState("loading", "Enviando imagem e processando...");
+
+        try {
+          const formData = new FormData();
+          formData.append("image", file);
+
+          const response = await fetch(`${API_URL}/upload`, {
+            method: "POST",
+            body: formData,
+          });
+
+          const data = await response.json();
+
+          if (!response.ok) throw new Error(data.message || "Erro no upload");
+
+          requestId = data.requestId;
+          setUploadState("loading", "Imagem recebida! Analisando ingredientes...");
+          checkResult();
+        } catch (error) {
+          setUploadState("error", "Erro: " + error.message);
+        }
+      }
+
+      async function checkResult() {
+        if (!requestId) return;
+
+        try {
+          const response = await fetch(`${API_URL}/result?requestId=${requestId}`);
+          const data = await response.json();
+
+          if (data.status === "PROCESSING") {
+            setTimeout(checkResult, 3000);
+          } else if (data.status === "COMPLETED") {
+            showResult(data.recipes);
+          } else if (data.status === "ERROR") {
+            throw new Error(data.errorMessage || "Erro no processamento");
+          }
+        } catch (error) {
+          setUploadState("error", "Erro ao verificar resultado: " + error.message);
+        }
+      }
+
+      function setUploadState(type, message) {
+        statusDiv.textContent = message;
+        statusDiv.className = type;
+        statusDiv.style.display = "block";
+        uploadButton.disabled = type === "loading";
+      }
+
+      function showResult(recipes) {
+        setUploadState("success", "Pronto! Suas receitas estão abaixo.");
+        resultadoDiv.innerHTML = formatRecipes(recipes);
+        resultadoDiv.style.display = "block";
+        uploadButton.disabled = false;
+      }
+
+      function formatRecipes(recipes) {
+        if (!recipes) return "<p>Nenhuma receita encontrada.</p>";
+        return recipes
+          .split("\n")
+          .map((line) => {
+            if (line.includes("**")) {
+              return `<h3>${line.replace(/\*\*/g, "")}</h3>`;
+            }
+            return `<p>${line}</p>`;
+          })
+          .join("");
+      }
+    </script>
+  </body>
+</html>
