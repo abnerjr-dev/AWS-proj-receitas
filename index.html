@@ -28,6 +28,7 @@
 
     <script>
       const API_URL = "https://1usbpeqsll.execute-api.us-east-1.amazonaws.com/dev";
+
       let requestId = null;
 
       const uploadArea = document.getElementById("uploadArea");
@@ -91,45 +92,116 @@
         const file = fileInput.files[0];
         if (!file) return;
 
-        setUploadState("loading", "Enviando imagem e processando...");
+        setUploadState("loading", "Convertendo imagem...");
 
         try {
-          const formData = new FormData();
-          formData.append("image", file);
+          const base64 = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = (e) => resolve(e.target.result);
+            reader.readAsDataURL(file);
+          });
+
+          const payload = {
+            image: base64,
+            fileName: file.name,
+          };
+
+          console.log("📤 Enviando imagem...");
 
           const response = await fetch(`${API_URL}/upload`, {
             method: "POST",
-            body: formData,
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
           });
 
           const data = await response.json();
+          console.log("📥 Resposta do upload:", data);
 
-          if (!response.ok) throw new Error(data.message || "Erro no upload");
+          if (!response.ok) {
+            throw new Error(data.error || `Erro ${response.status}`);
+          }
 
-          requestId = data.requestId;
-          setUploadState("loading", "Imagem recebida! Analisando ingredientes...");
+          requestId = data.data.requestId;
+
+          if (requestId) {
+            requestId = requestId.trim().replace(/\s+/g, "");
+            console.log("🆔 RequestId armazenado:", requestId);
+            console.log("📏 Comprimento do requestId:", requestId.length);
+          } else {
+            throw new Error("RequestId não recebido da API");
+          }
+
+          setUploadState("loading", "Imagem recebida! Processando...");
           checkResult();
         } catch (error) {
-          setUploadState("error", "Erro: " + error.message);
+          console.error("❌ Erro no upload:", error);
+          setUploadState("error", "Falha no envio: " + error.message);
         }
       }
 
       async function checkResult() {
-        if (!requestId) return;
+        if (!requestId) {
+          console.error("❌ Nenhum requestId disponível");
+          return;
+        }
+
+        const cleanRequestId = requestId.trim().replace(/\s+/g, "");
+
+        console.log("🔍 Verificando resultado para requestId:", cleanRequestId);
+        console.log("📏 Comprimento do requestId:", cleanRequestId.length);
 
         try {
-          const response = await fetch(`${API_URL}/result?requestId=${requestId}`);
-          const data = await response.json();
+          const queryUrl = `${API_URL}/result?requestId=${encodeURIComponent(cleanRequestId)}`;
+          console.log("📡 URL da consulta:", queryUrl);
 
-          if (data.status === "PROCESSING") {
+          const response = await fetch(queryUrl);
+          console.log("📊 Status da resposta:", response.status);
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error("❌ Texto do erro:", errorText);
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const data = await response.json();
+          console.log("✅ Dados recebidos:", data);
+
+          if (data.success === false) {
+            throw new Error(data.error || "Erro na consulta");
+          }
+
+          const resultData = data.data || data;
+          const status = resultData.status;
+
+          console.log("📝 Status atual:", status);
+
+          if (status === "PROCESSING" || status === "ANALYZING_IMAGE" || status === "GENERATING_RECIPES") {
+            const message = resultData.message || getStatusMessage(status);
+            setUploadState("loading", message);
+            console.log("⏳ Ainda processando, verificando novamente em 3s...");
             setTimeout(checkResult, 3000);
-          } else if (data.status === "COMPLETED") {
-            showResult(data.recipes);
-          } else if (data.status === "ERROR") {
-            throw new Error(data.errorMessage || "Erro no processamento");
+          } else if (status === "COMPLETED") {
+            console.log("🎉 Processamento completo! Mostrando receitas...");
+            showResult(resultData.recipes);
+          } else if (status === "ERROR") {
+            throw new Error(resultData.errorMessage || "Erro no processamento");
+          } else {
+            console.warn("⚠️ Status desconhecido:", status);
+            setUploadState("loading", "Processando...");
+            setTimeout(checkResult, 3000);
           }
         } catch (error) {
-          setUploadState("error", "Erro ao verificar resultado: " + error.message);
+          console.error("💥 Erro ao verificar resultado:", error);
+
+          if (error.message.includes("HTTP 400")) {
+            setUploadState("error", "Erro na consulta. Por favor, recarregue a página e tente novamente.");
+          } else {
+            setUploadState("error", "Erro ao verificar resultado: " + error.message);
+
+            setTimeout(checkResult, 5000);
+          }
         }
       }
 

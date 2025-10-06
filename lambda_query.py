@@ -1,114 +1,132 @@
 import json
 import boto3
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
+import logging
+from decimal import Decimal
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["DYNAMODB_TABLE"])
 
 
+def convert_decimals(obj):
+    """Converte objetos Decimal para tipos nativos Python para serialização JSON"""
+    if isinstance(obj, list):
+        return [convert_decimals(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_decimals(value) for key, value in obj.items()}
+    elif isinstance(obj, Decimal):
+        # Converte Decimal para float ou int
+        return float(obj) if obj % 1 != 0 else int(obj)
+    else:
+        return obj
+
+
 def lambda_handler(event, context):
-    print("Query event:", json.dumps(event))
+    print("=== QUERY EVENT ===")
+    print(f"HTTP Method: {event.get('httpMethod')}")
+    print(f"Query params: {event.get('queryStringParameters')}")
 
     try:
-        # Handle CORS preflight request
+        # Handle OPTIONS preflight
         if event.get("httpMethod") == "OPTIONS":
             return {
                 "statusCode": 200,
                 "headers": {
-                    "Content-Type": "application/json",
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Methods": "GET, OPTIONS",
                     "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
                 },
-                "body": json.dumps({"message": "CORS preflight"}),
+                "body": "",
             }
 
-        # Extrai requestId dos query parameters
-        query_params = event.get("queryStringParameters", {}) or {}
-        request_id = query_params.get("requestId")
+        # Handle GET request
+        if event.get("httpMethod") == "GET":
+            return handle_get_request(event)
+        else:
+            return error_response("Método não permitido", 405)
+
+    except Exception as e:
+        print(f"Query handler error: {e}")
+        return error_response(f"Erro interno na consulta: {str(e)}")
+
+
+def handle_get_request(event):
+    """Handle GET request for results"""
+    try:
+        query_params = event.get("queryStringParameters") or {}
+        request_id = query_params.get("requestId", "")
+
+        print(f"Query parameters: {query_params}")
+        print(f"RequestId: '{request_id}'")
 
         if not request_id:
-            return error_response("Parâmetro requestId é obrigatório", 400)
+            return error_response("Parâmetro requestId é obrigatório")
 
-        # Consulta resultado no DynamoDB
+        request_id = request_id.strip()
+
+        print(f"Querying DynamoDB for: {request_id}")
+
+        # Consulta DynamoDB
         response = table.get_item(Key={"requestId": request_id})
 
         if "Item" not in response:
-            return error_response("Solicitação não encontrada", 404)
+            print("Item not found in DynamoDB")
+            return error_response("Solicitação não encontrada ou expirada", 404)
 
         item = response["Item"]
         status = item.get("status", "UNKNOWN")
 
-        # Prepara resposta baseada no status
+        print(f"Item found, status: {status}")
+        print(f"Item keys: {list(item.keys())}")
+
+        cleaned_item = convert_decimals(item)
+
+        # Prepara resposta
         response_data = {
             "requestId": request_id,
             "status": status,
-            "createdAt": item.get("createdAt"),
-            "updatedAt": item.get("updatedAt"),
+            "createdAt": cleaned_item.get("createdAt"),
+            "updatedAt": cleaned_item.get("updatedAt"),
         }
 
         if status == "COMPLETED":
-            response_data.update(
-                {
-                    "ingredients": item.get("ingredients", []),
-                    "recipes": item.get("recipes", ""),
-                    "processingTime": calculate_processing_time(
-                        item.get("createdAt"), item.get("updatedAt")
-                    ),
-                }
-            )
+            response_data["ingredients"] = cleaned_item.get("ingredients", [])
+            response_data["recipes"] = cleaned_item.get("recipes", "")
+            response_data["completedAt"] = cleaned_item.get("completedAt")
+            print("Returning COMPLETED result")
+
         elif status == "ERROR":
-            response_data.update(
-                {"errorMessage": item.get("errorMessage", "Erro desconhecido")}
+            response_data["errorMessage"] = cleaned_item.get(
+                "errorMessage", "Erro desconhecido"
             )
+            print("Returning ERROR result")
+
         else:
-            response_data.update(
-                {
-                    "message": get_status_message(status),
-                    "estimatedWaitTime": get_estimated_wait_time(status),
-                }
-            )
+            # Status intermediários
+            response_data["message"] = get_status_message(status)
+            print(f"Returning {status} result")
 
         return success_response(response_data)
 
     except Exception as e:
-        print(f"Error querying result: {str(e)}")
-        return error_response(f"Erro na consulta: {str(e)}", 500)
-
-
-def calculate_processing_time(created_at, updated_at):
-    """Calcula o tempo total de processamento"""
-    try:
-        if created_at and updated_at:
-            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-            duration = updated - created
-            return f"{duration.total_seconds():.1f} segundos"
-        return "N/A"
-    except:
-        return "N/A"
+        print(f"GET request error: {e}")
+        return error_response(f"Erro ao consultar resultado: {str(e)}")
 
 
 def get_status_message(status):
+    """Mensagens amigáveis para cada status"""
     messages = {
-        "PROCESSING": "Sua imagem está na fila de processamento...",
+        "PROCESSING": "Sua imagem está sendo processada...",
         "ANALYZING_IMAGE": "🔍 Analisando ingredientes na imagem...",
-        "GENERATING_RECIPES": "👨‍🍳 Gerando receitas personalizadas...",
-        "COMPLETED": "✅ Processamento concluído!",
-        "ERROR": "❌ Erro no processamento",
-        "UNKNOWN": "Status desconhecido",
+        "GENERATING_RECIPES": "👩‍🍳 Gerando receitas personalizadas...",
+        "UPLOADING": "📤 Fazendo upload da imagem...",
+        "QUEUED": "⏳ Na fila de processamento...",
     }
     return messages.get(status, "Processando sua solicitação...")
-
-
-def get_estimated_wait_time(status):
-    estimates = {
-        "PROCESSING": "10-30 segundos",
-        "ANALYZING_IMAGE": "5-15 segundos",
-        "GENERATING_RECIPES": "5-10 segundos",
-    }
-    return estimates.get(status, "Alguns segundos")
 
 
 def success_response(data):
@@ -120,11 +138,13 @@ def success_response(data):
             "Access-Control-Allow-Methods": "GET, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
         },
-        "body": json.dumps(data),
+        "body": json.dumps(
+            {"success": True, "data": data, "timestamp": datetime.utcnow().isoformat()}
+        ),
     }
 
 
-def error_response(message, status_code=500):
+def error_response(message, status_code=400):
     return {
         "statusCode": status_code,
         "headers": {
@@ -133,5 +153,11 @@ def error_response(message, status_code=500):
             "Access-Control-Allow-Methods": "GET, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
         },
-        "body": json.dumps({"error": message}),
+        "body": json.dumps(
+            {
+                "success": False,
+                "error": message,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        ),
     }

@@ -1,287 +1,276 @@
 import json
 import boto3
 import uuid
+import base64
 from datetime import datetime
 import os
-import base64
 import logging
 
-# Configure logging
+# Configuração de logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Clients AWS
 s3_client = boto3.client("s3")
 sqs_client = boto3.client("sqs")
 dynamodb = boto3.resource("dynamodb")
 
+# Configurações
 table = dynamodb.Table(os.environ["DYNAMODB_TABLE"])
 queue_url = os.environ["SQS_QUEUE_URL"]
 bucket_name = os.environ["PROCESSING_BUCKET"]
 
-# CORS headers for all responses
-CORS_HEADERS = {
-    "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Content-Type",
-}
-
 
 def lambda_handler(event, context):
-    logger.info("=== LAMBDA ORCHESTRATOR STARTED ===")
-    logger.info("chegou na Lambda Orchestrator!")
-
-    # Handle CORS preflight requests
-    if event.get("httpMethod") == "OPTIONS":
-        logger.info("Handling CORS preflight request")
-        return {
-            "statusCode": 200,
-            "headers": CORS_HEADERS,
-            "body": json.dumps({"message": "CORS preflight"}),
-        }
+    logger.info(
+        "Event received",
+        extra={
+            "http_method": event.get("httpMethod"),
+            "path": event.get("path"),
+            "content_type": event.get("headers", {}).get("Content-Type", ""),
+            "content_length": len(event.get("body", "")),
+        },
+    )
 
     try:
-        # Safe event debugging - NEVER use json.dumps on entire event
-        logger.info("=== SAFE EVENT DEBUGGING ===")
-        logger.info(f"1. BASIC EVENT INFO:")
-        logger.info(f"   Resource: {event.get('resource')}")
-        logger.info(f"   Path: {event.get('path')}")
-        logger.info(f"   HTTP Method: {event.get('httpMethod')}")
-        logger.info(f"   isBase64Encoded: {event.get('isBase64Encoded')}")
+        # Log completo para debugging
+        print("=== EVENT DETAILS ===")
+        print(f"HTTP Method: {event.get('httpMethod')}")
+        print(f"Content-Type: {event.get('headers', {}).get('Content-Type')}")
+        print(f"Body isBase64: {event.get('isBase64Encoded', False)}")
+        print(f"Body length: {len(event.get('body', ''))}")
 
-        # Safe headers logging
-        logger.info(f"2. HEADERS:")
-        headers = event.get("headers", {})
-        for key, value in headers.items():
-            if isinstance(value, str) and len(value) < 100:
-                logger.info(f"   {key}: {value}")
+        # Handle preflight OPTIONS
+        if event.get("httpMethod") == "OPTIONS":
+            return handle_options_request()
 
-        # Handle body SAFELY
-        if "body" in event:
-            logger.info(f"3. BODY ANALYSIS:")
-            logger.info(f"   Body exists: Yes")
-            logger.info(f"   Body type: {type(event['body'])}")
-            body_length = len(event["body"]) if event.get("body") else 0
-            logger.info(f"   Body length: {body_length}")
-
-            if event.get("isBase64Encoded", False):
-                logger.info(f"   Body is base64 encoded")
-                try:
-                    decoded_bytes = base64.b64decode(event["body"])
-                    logger.info(f"   Decoded size: {len(decoded_bytes)} bytes")
-
-                    # Check if it's image data
-                    if len(decoded_bytes) > 4:
-                        magic_bytes = decoded_bytes[:4]
-                        if magic_bytes.startswith(b"\xff\xd8"):
-                            logger.info(f"   Body is JPEG image data")
-                        elif magic_bytes.startswith(b"\x89PNG"):
-                            logger.info(f"   Body is PNG image data")
-                        elif b"multipart/form-data" in magic_bytes:
-                            logger.info(f"   Body is multipart form data")
-                        else:
-                            logger.info(f"   Body is binary data (unknown type)")
-
-                    # Try to decode as text for multipart form data
-                    try:
-                        body_text = decoded_bytes.decode("utf-8")
-                        if len(body_text) < 10000:  # Reasonable size for form data
-                            logger.info(f"   Body decoded as text successfully")
-                            # Look for multipart indicators
-                            if "multipart/form-data" in body_text.lower():
-                                logger.info(f"   Contains multipart/form-data")
-                            if "filename=" in body_text:
-                                logger.info(f"   Contains file upload")
-                    except UnicodeDecodeError:
-                        logger.info(f"   Body is binary data (cannot decode as text)")
-
-                except Exception as e:
-                    logger.error(f"   Decoding error: {str(e)}")
-                    return error_response(f"Body decoding error: {str(e)}")
-            else:
-                # Body is not base64 encoded
-                body = event["body"]
-                if isinstance(body, str) and len(body) < 1000:
-                    logger.info(f"   Body (text): {body[:500]}")
-                else:
-                    logger.info(
-                        f"   Body is large or binary: {len(body) if body else 0} chars"
-                    )
-
-        logger.info("=== END SAFE DEBUGGING ===")
-
-        # Process the request
-        if "body" in event:
-            logger.info("Starting request processing...")
-
-            if event.get("isBase64Encoded", False):
-                # Decode base64 and handle as text for multipart form data
-                try:
-                    decoded_bytes = base64.b64decode(event["body"])
-                    body = decoded_bytes.decode("utf-8")
-                    logger.info("Body successfully decoded from base64 to UTF-8")
-                except Exception as e:
-                    logger.error(f"Error decoding body: {str(e)}")
-                    return error_response(f"Error decoding request body: {str(e)}")
-            else:
-                body = event["body"]
-
-            return process_multipart_form_data(body, event.get("headers", {}))
+        # Handle POST request
+        if event.get("httpMethod") == "POST":
+            return handle_post_request(event)
         else:
-            return error_response("No body in request")
+            return error_response("Método não permitido", 405)
 
     except Exception as e:
-        logger.error(f"Error in lambda handler: {str(e)}")
-        return error_response(f"Internal error: {str(e)}")
+        logger.error("Handler error", extra={"error": str(e)})
+        return error_response(f"Erro interno: {str(e)}")
 
 
-def process_multipart_form_data(body, headers):
-    """Process multipart form data with safe logging"""
-    logger.info("=== MULTIPART FORM PROCESSING START ===")
+def handle_options_request():
+    """Handle CORS preflight"""
+    return {
+        "statusCode": 200,
+        "headers": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+            "Access-Control-Max-Age": "86400",
+        },
+        "body": "",
+    }
 
-    logger.info(f"Content-Type: {headers.get('content-type', 'Unknown')}")
-    logger.info(f"Body length: {len(body) if body else 0}")
 
-    # Safe body sampling for debugging
-    if body and len(body) > 500:
-        logger.info(f"Body sample (first 500 chars): {body[:500]}...")
-    elif body:
-        logger.info(f"Body: {body}")
-    else:
-        logger.info("Body is empty")
-
+def handle_post_request(event):
+    """Handle POST request - VERSÃO TOLERANTE"""
     try:
-        # Parse multipart form data
-        lines = body.split("\r\n")
-        image_data = None
-        filename = None
-        original_filename = None
+        body = event.get("body", "")
+        is_base64 = event.get("isBase64Encoded", False)
+        content_type = event.get("headers", {}).get("Content-Type") or event.get(
+            "headers", {}
+        ).get("content-type", "")
 
-        logger.info(f"Multipart lines: {len(lines)}")
-
-        for i, line in enumerate(lines):
-            if "filename=" in line:
-                # Extract filename - handle ASCII encoding
-                original_filename = line.split("filename=")[1].replace('"', "")
-                # Create ASCII-safe filename for S3
-                filename = original_filename.encode("ascii", "ignore").decode()
-
-                logger.info(f"Found file upload: {original_filename}")
-                logger.info(f"Safe filename for S3: {filename}")
-
-                # Find the image data (starts a few lines after filename)
-                image_start = i + 3  # Skip headers after filename
-                if image_start < len(lines):
-                    # Join the remaining lines as image data
-                    image_data = "\r\n".join(lines[image_start:])
-                    # Remove the final boundary
-                    if "------" in image_data:
-                        image_data = image_data.split("------")[0]
-                    logger.info(
-                        f"Image data extracted, length: {len(image_data) if image_data else 0}"
-                    )
-                break
-
-        if not image_data or not filename:
-            logger.error("No image data or filename found in multipart form")
-            return error_response("Nenhuma imagem encontrada no upload")
-
-        return process_image_upload(image_data, filename, original_filename)
-
-    except Exception as e:
-        logger.error(f"Error processing multipart form: {str(e)}")
-        return error_response(f"Erro ao processar formulário: {str(e)}")
-
-
-def process_image_upload(image_data, safe_filename, original_filename):
-    """Process image upload with safe S3 filename"""
-    logger.info("=== IMAGE UPLOAD PROCESSING START ===")
-
-    try:
-        request_id = str(uuid.uuid4())
-        file_name = f"images/{request_id}_{safe_filename}"
-
-        logger.info(f"Request ID: {request_id}")
-        logger.info(f"S3 File Key: {file_name}")
-        logger.info(f"Original filename: {original_filename}")
-        logger.info(f"Safe filename: {safe_filename}")
-
-        # Clean the image data - remove any remaining boundary text
-        clean_image_data = image_data.strip()
-        if clean_image_data.endswith("--"):
-            clean_image_data = clean_image_data[:-2].strip()
-
-        logger.info(f"Cleaned image data length: {len(clean_image_data)}")
-
-        # Handle base64 image data if it's data URL format
-        if isinstance(clean_image_data, str) and clean_image_data.startswith(
-            "data:image"
-        ):
-            logger.info("Detected data URL format, extracting base64 data...")
-            clean_image_data = clean_image_data.split(",")[1]
-
-        # Convert to bytes for S3 upload
-        if isinstance(clean_image_data, str):
-            logger.info("Converting string image data to bytes...")
-            try:
-                image_bytes = base64.b64decode(clean_image_data)
-                logger.info(f"Image bytes size: {len(image_bytes)}")
-            except Exception as e:
-                logger.error(f"Base64 decode error: {str(e)}")
-                # If it's not base64, try direct encoding
-                image_bytes = clean_image_data.encode("utf-8")
-        else:
-            image_bytes = clean_image_data
-
-        # Upload to S3 with safe metadata
-        logger.info(f"Uploading to S3 bucket: {bucket_name}")
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=file_name,
-            Body=image_bytes,
-            ContentType="image/jpeg",
-            Metadata={
-                "original-filename": original_filename.encode(
-                    "ascii", "xmlcharrefreplace"
-                ).decode(),
-                "request-id": request_id,
+        logger.info(
+            "Processing POST request",
+            extra={
+                "content_type": content_type,
+                "is_base64": is_base64,
+                "body_length": len(body),
             },
         )
 
-        image_url = f"s3://{bucket_name}/{file_name}"
-        logger.info(f"Image uploaded successfully: {image_url}")
+        if not content_type:
+            logger.warning("Content-Type header missing, attempting to detect format")
+            # Tenta detectar se é JSON
+            if body.strip().startswith("{") or "image" in body:
+                content_type = "application/json"
+                logger.info("Auto-detected as JSON")
+            else:
+                return error_response("Header Content-Type é obrigatório")
 
-        # Save to DynamoDB
-        logger.info("Saving to DynamoDB...")
+        # Decodifica se necessário
+        if is_base64:
+            try:
+                body = base64.b64decode(body)
+                logger.info("Body base64 decoded")
+            except Exception as e:
+                logger.error("Base64 decode failed", extra={"error": str(e)})
+                return error_response("Formato base64 inválido")
+
+        # Processa baseado no Content-Type
+        if "application/json" in content_type:
+            return handle_json_body(body, is_base64)
+        else:
+            return error_response(f"Content-Type não suportado: {content_type}")
+
+    except Exception as e:
+        logger.error("POST handling error", extra={"error": str(e)})
+        return error_response(f"Erro ao processar requisição: {str(e)}")
+
+
+def handle_json_body(body, was_base64):
+    """Processa corpo JSON"""
+    try:
+        # Se body ainda é bytes, decode para string
+        if isinstance(body, bytes):
+            body_str = body.decode("utf-8")
+        else:
+            body_str = body
+
+        body_data = json.loads(body_str)
+
+        # Extrai a imagem (pode ser base64 ou data URL)
+        image_data = body_data.get("image", "")
+
+        if not image_data:
+            return error_response("Campo 'image' não encontrado no JSON")
+
+        logger.info(
+            "JSON body parsed",
+            extra={
+                "has_image": bool(image_data),
+                "image_data_length": len(image_data),
+                "has_fileName": "fileName" in body_data,
+            },
+        )
+
+        # Processa a imagem base64
+        return process_base64_image(image_data, body_data.get("fileName", "image.jpg"))
+
+    except json.JSONDecodeError as e:
+        logger.error("JSON decode error", extra={"error": str(e)})
+        return error_response("JSON inválido no corpo da requisição")
+    except Exception as e:
+        logger.error("JSON body processing error", extra={"error": str(e)})
+        return error_response(f"Erro ao processar JSON: {str(e)}")
+
+
+def process_base64_image(image_data, file_name):
+    """Processa imagem em base64"""
+    try:
+        # Remove data URL prefix se existir
+        if image_data.startswith("data:image"):
+            parts = image_data.split(",")
+            if len(parts) == 2:
+                image_data = parts[1]
+                logger.info("Removed data URL prefix")
+
+        # Valida se é base64 válido
+        try:
+            image_bytes = base64.b64decode(image_data)
+            logger.info(
+                "Base64 decoded successfully",
+                extra={
+                    "original_length": len(image_data),
+                    "decoded_length": len(image_bytes),
+                },
+            )
+        except Exception as e:
+            logger.error("Base64 decode failed", extra={"error": str(e)})
+            return error_response("Formato base64 inválido")
+
+        # Valida tamanho mínimo
+        if len(image_bytes) < 100:  # 100 bytes mínimo
+            return error_response("Imagem muito pequena ou vazia")
+
+        # Valida formato da imagem
+        if not is_valid_image_format(image_bytes):
+            return error_response("Formato de imagem não suportado. Use JPEG ou PNG")
+
+        # Continua com o processamento
+        return process_image_upload(image_bytes, file_name)
+
+    except Exception as e:
+        logger.error("Base64 image processing error", extra={"error": str(e)})
+        return error_response(f"Erro ao processar imagem: {str(e)}")
+
+
+def is_valid_image_format(image_bytes):
+    """Valida se é JPEG ou PNG válido"""
+    try:
+        # JPEG magic numbers
+        jpeg_signatures = [b"\xff\xd8\xff", b"\xff\xd8"]
+        # PNG magic number
+        png_signature = b"\x89PNG\r\n\x1a\n"
+
+        is_jpeg = any(image_bytes.startswith(sig) for sig in jpeg_signatures)
+        is_png = image_bytes.startswith(png_signature)
+
+        logger.info(
+            "Image format validation",
+            extra={"is_jpeg": is_jpeg, "is_png": is_png, "is_valid": is_jpeg or is_png},
+        )
+
+        return is_jpeg or is_png
+    except Exception as e:
+        logger.error("Image format validation error", extra={"error": str(e)})
+        return False
+
+
+def process_image_upload(image_bytes, file_name):
+    """Processa upload da imagem e inicia pipeline"""
+    try:
+        # Gera ID único
+        request_id = str(uuid.uuid4())
+        s3_key = f"images/{request_id}.jpg"
+
+        logger.info(
+            "Starting image processing",
+            extra={
+                "request_id": request_id,
+                "image_size": len(image_bytes),
+                "s3_key": s3_key,
+            },
+        )
+
+        # Upload para S3
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=image_bytes,
+            ContentType="image/jpeg",
+            Metadata={
+                "request_id": request_id,
+                "original_name": file_name,
+                "processed_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+        # Salva estado no DynamoDB
         table.put_item(
             Item={
                 "requestId": request_id,
                 "status": "PROCESSING",
                 "createdAt": datetime.utcnow().isoformat(),
-                "imageS3Key": file_name,
-                "originalFilename": original_filename,
-                "safeFilename": safe_filename,
-                "imageUrl": image_url,
+                "imageS3Key": s3_key,
+                "imageSize": len(image_bytes),
                 "updatedAt": datetime.utcnow().isoformat(),
+                "expireAt": int(datetime.utcnow().timestamp()) + 3600,
             }
         )
 
-        # Send to SQS
-        logger.info("Sending message to SQS...")
+        # Envia para SQS
         sqs_client.send_message(
             QueueUrl=queue_url,
             MessageBody=json.dumps(
                 {
                     "requestId": request_id,
-                    "imageS3Key": file_name,
+                    "imageS3Key": s3_key,
                     "bucketName": bucket_name,
-                    "imageUrl": image_url,
-                    "originalFilename": original_filename,
+                    "timestamp": datetime.utcnow().isoformat(),
                 }
             ),
         )
 
-        logger.info("=== IMAGE UPLOAD PROCESSING COMPLETED ===")
+        logger.info("Pipeline started successfully", extra={"request_id": request_id})
 
         return success_response(
             {
@@ -292,23 +281,39 @@ def process_image_upload(image_data, safe_filename, original_filename):
         )
 
     except Exception as e:
-        logger.error(f"Error processing image upload: {str(e)}")
-        return error_response(f"Erro ao processar imagem: {str(e)}")
+        logger.error("Image processing pipeline error", extra={"error": str(e)})
+        return error_response(f"Erro ao iniciar processamento: {str(e)}")
 
 
 def success_response(data):
-    """Return successful API response with CORS headers"""
-    response = {"statusCode": 200, "headers": CORS_HEADERS, "body": json.dumps(data)}
-    logger.info(f"Returning success response: {data}")
-    return response
-
-
-def error_response(message, status_code=500):
-    """Return error API response with CORS headers"""
-    response = {
-        "statusCode": status_code,
-        "headers": CORS_HEADERS,
-        "body": json.dumps({"error": message}),
+    return {
+        "statusCode": 200,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+        },
+        "body": json.dumps(
+            {"success": True, "data": data, "timestamp": datetime.utcnow().isoformat()}
+        ),
     }
-    logger.error(f"Returning error response ({status_code}): {message}")
-    return response
+
+
+def error_response(message, status_code=400):
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+        },
+        "body": json.dumps(
+            {
+                "success": False,
+                "error": message,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        ),
+    }
